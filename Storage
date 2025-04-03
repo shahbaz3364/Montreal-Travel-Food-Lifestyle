@@ -1,0 +1,240 @@
+import { 
+  users, type User, type InsertUser, 
+  expenses, type Expense, type InsertExpense,
+  budgets, type Budget, type InsertBudget,
+  type MonthlyExpenseSummary, type ExpenseSummary, type ExpenseCategory
+} from "@shared/schema";
+import session from "express-session";
+import createMemoryStore from "memorystore";
+
+export interface IStorage {
+  // User operations
+  getUser(id: number): Promise<User | undefined>;
+  getUserByUsername(username: string): Promise<User | undefined>;
+  createUser(user: InsertUser): Promise<User>;
+  
+  // Expense operations
+  getExpense(id: number): Promise<Expense | undefined>;
+  listExpensesByUser(userId: number, limit?: number): Promise<Expense[]>;
+  listExpensesByMonth(userId: number, month: number, year: number): Promise<Expense[]>;
+  createExpense(userId: number, expense: InsertExpense): Promise<Expense>;
+  deleteExpense(id: number): Promise<boolean>;
+  
+  // Budget operations
+  getBudget(userId: number, month: number, year: number): Promise<Budget | undefined>;
+  createOrUpdateBudget(userId: number, budget: InsertBudget): Promise<Budget>;
+  
+  // Summary operations
+  getMonthlyExpenseSummary(userId: number, month: number, year: number): Promise<MonthlyExpenseSummary>;
+  getCategoryExpenses(userId: number, month: number, year: number): Promise<ExpenseSummary[]>;
+  getMonthlyTotalsByCategory(userId: number, category: ExpenseCategory, months: number): Promise<{month: number, year: number, total: number}[]>;
+  
+  // Session store
+  sessionStore: session.SessionStore;
+}
+
+export class MemStorage implements IStorage {
+  private users: Map<number, User>;
+  private expenses: Map<number, Expense>;
+  private budgets: Map<string, Budget>;
+  private userIdCounter: number;
+  private expenseIdCounter: number;
+  private budgetIdCounter: number;
+  public sessionStore: session.SessionStore;
+
+  constructor() {
+    this.users = new Map();
+    this.expenses = new Map();
+    this.budgets = new Map();
+    this.userIdCounter = 1;
+    this.expenseIdCounter = 1;
+    this.budgetIdCounter = 1;
+    
+    // Initialize session store
+    const MemoryStore = createMemoryStore(session);
+    this.sessionStore = new MemoryStore({
+      checkPeriod: 86400000 // Prune expired sessions every day
+    });
+    
+    // Create a demo user
+    this.createUser({
+      username: "demo",
+      password: "password"
+    });
+    
+    // Set a default budget for the demo user
+    const currentDate = new Date();
+    this.createOrUpdateBudget(1, {
+      amount: 2000,
+      month: currentDate.getMonth() + 1,
+      year: currentDate.getFullYear()
+    });
+  }
+
+  // User operations
+  async getUser(id: number): Promise<User | undefined> {
+    return this.users.get(id);
+  }
+
+  async getUserByUsername(username: string): Promise<User | undefined> {
+    return Array.from(this.users.values()).find(
+      (user) => user.username === username
+    );
+  }
+
+  async createUser(insertUser: InsertUser): Promise<User> {
+    const id = this.userIdCounter++;
+    const user: User = { ...insertUser, id };
+    this.users.set(id, user);
+    return user;
+  }
+  
+  // Expense operations
+  async getExpense(id: number): Promise<Expense | undefined> {
+    return this.expenses.get(id);
+  }
+  
+  async listExpensesByUser(userId: number, limit?: number): Promise<Expense[]> {
+    const userExpenses = Array.from(this.expenses.values())
+      .filter(expense => expense.userId === userId)
+      .sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime());
+    
+    return limit ? userExpenses.slice(0, limit) : userExpenses;
+  }
+  
+  async listExpensesByMonth(userId: number, month: number, year: number): Promise<Expense[]> {
+    return Array.from(this.expenses.values())
+      .filter(expense => {
+        const expenseDate = new Date(expense.date);
+        return expense.userId === userId && 
+               expenseDate.getMonth() + 1 === month && 
+               expenseDate.getFullYear() === year;
+      })
+      .sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime());
+  }
+  
+  async createExpense(userId: number, insertExpense: InsertExpense): Promise<Expense> {
+    const id = this.expenseIdCounter++;
+    const createdAt = new Date();
+    const expense: Expense = { 
+      ...insertExpense, 
+      id, 
+      userId, 
+      createdAt
+    };
+    this.expenses.set(id, expense);
+    return expense;
+  }
+  
+  async deleteExpense(id: number): Promise<boolean> {
+    return this.expenses.delete(id);
+  }
+  
+  // Budget operations
+  async getBudget(userId: number, month: number, year: number): Promise<Budget | undefined> {
+    const key = `${userId}-${month}-${year}`;
+    return this.budgets.get(key);
+  }
+  
+  async createOrUpdateBudget(userId: number, insertBudget: InsertBudget): Promise<Budget> {
+    const key = `${userId}-${insertBudget.month}-${insertBudget.year}`;
+    const existingBudget = this.budgets.get(key);
+    
+    if (existingBudget) {
+      const updatedBudget: Budget = { 
+        ...existingBudget, 
+        amount: insertBudget.amount 
+      };
+      this.budgets.set(key, updatedBudget);
+      return updatedBudget;
+    }
+    
+    const id = this.budgetIdCounter++;
+    const budget: Budget = { 
+      ...insertBudget, 
+      id, 
+      userId
+    };
+    this.budgets.set(key, budget);
+    return budget;
+  }
+  
+  // Summary operations
+  async getMonthlyExpenseSummary(userId: number, month: number, year: number): Promise<MonthlyExpenseSummary> {
+    const expenses = await this.listExpensesByMonth(userId, month, year);
+    const budget = await this.getBudget(userId, month, year);
+    
+    const totalSpent = expenses.reduce((total, expense) => 
+      total + Number(expense.amount), 0);
+    
+    const budgetAmount = budget ? Number(budget.amount) : 0;
+    const budgetRemaining = Math.max(0, budgetAmount - totalSpent);
+    const budgetPercentage = budgetAmount > 0 
+      ? Math.min(100, Math.round((totalSpent / budgetAmount) * 100)) 
+      : 0;
+    
+    const categories = await this.getCategoryExpenses(userId, month, year);
+    
+    return {
+      totalSpent,
+      budget: budgetAmount,
+      budgetRemaining,
+      budgetPercentage,
+      categories
+    };
+  }
+  
+  async getCategoryExpenses(userId: number, month: number, year: number): Promise<ExpenseSummary[]> {
+    const expenses = await this.listExpensesByMonth(userId, month, year);
+    const totalSpent = expenses.reduce((total, expense) => 
+      total + Number(expense.amount), 0);
+    
+    // Group expenses by category
+    const categoryMap = new Map<ExpenseCategory, number>();
+    
+    expenses.forEach(expense => {
+      const category = expense.category as ExpenseCategory;
+      const currentAmount = categoryMap.get(category) || 0;
+      categoryMap.set(category, currentAmount + Number(expense.amount));
+    });
+    
+    // Convert to array and calculate percentages
+    return Array.from(categoryMap.entries())
+      .map(([category, total]) => ({
+        category,
+        total,
+        percentage: totalSpent > 0 ? Math.round((total / totalSpent) * 100) : 0
+      }))
+      .sort((a, b) => b.total - a.total);
+  }
+  
+  async getMonthlyTotalsByCategory(
+    userId: number, 
+    category: ExpenseCategory, 
+    months: number
+  ): Promise<{month: number, year: number, total: number}[]> {
+    const currentDate = new Date();
+    const result: {month: number, year: number, total: number}[] = [];
+    
+    // Generate data for the last n months
+    for (let i = 0; i < months; i++) {
+      const targetDate = new Date(currentDate);
+      targetDate.setMonth(currentDate.getMonth() - i);
+      
+      const month = targetDate.getMonth() + 1;
+      const year = targetDate.getFullYear();
+      
+      const expenses = await this.listExpensesByMonth(userId, month, year);
+      const total = expenses
+        .filter(e => e.category === category)
+        .reduce((sum, e) => sum + Number(e.amount), 0);
+      
+      result.push({ month, year, total });
+    }
+    
+    // Return in chronological order
+    return result.reverse();
+  }
+}
+
+export const storage = new MemStorage();
